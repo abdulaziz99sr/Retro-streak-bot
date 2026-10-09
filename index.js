@@ -1,9 +1,13 @@
+
 const {
   Client,
   GatewayIntentBits,
-  Events,
-  PermissionFlagsBits
+  Events
 } = require('discord.js');
+
+// =====================================
+// SETTINGS
+// =====================================
 
 const TOKEN = process.env.TOKEN;
 
@@ -16,6 +20,10 @@ const CHANNEL_IDS = [
 
 const STICKY_TEXT = 'Posts Only | بوستات فقط';
 
+// =====================================
+// CLIENT
+// =====================================
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -24,13 +32,10 @@ const client = new Client({
   ]
 });
 
-// Prevent simultaneous updates in the same channel
+// منع تداخل العمليات في نفس الروم
 const channelQueues = new Map();
 
-// Remember the last sticky message
-const stickyIds = new Map();
-
-function runInQueue(channelId, task) {
+function enqueue(channelId, task) {
   const previous =
     channelQueues.get(channelId) || Promise.resolve();
 
@@ -40,116 +45,110 @@ function runInQueue(channelId, task) {
 
   channelQueues.set(channelId, current);
 
-  current.finally(() => {
-    if (channelQueues.get(channelId) === current) {
-      channelQueues.delete(channelId);
-    }
-  }).catch(() => {});
+  current
+    .finally(() => {
+      if (channelQueues.get(channelId) === current) {
+        channelQueues.delete(channelId);
+      }
+    })
+    .catch(() => {});
 
   return current;
 }
 
-// Check whether a message contains a photo or video
-function hasMedia(message) {
-  const attachments = [...message.attachments.values()];
+// =====================================
+// CHECK IMAGE OR VIDEO
+// =====================================
 
-  const validAttachment = attachments.some(file => {
-    const type = file.contentType || '';
-    const name = file.name || '';
+function isAllowedPost(message) {
+  const hasMediaFile = message.attachments.some(file => {
+    const type = (file.contentType || '').toLowerCase();
+    const name = (file.name || '').toLowerCase();
 
-    return (
-      type.startsWith('image/') ||
-      type.startsWith('video/') ||
-      /\.(png|jpg|jpeg|gif|webp|bmp|heic|mp4|mov|webm|m4v|avi)$/i.test(name)
-    );
+    if (type.startsWith('image/')) return true;
+    if (type.startsWith('video/')) return true;
+
+    return /\.(png|jpg|jpeg|gif|webp|heic|bmp|mp4|mov|webm|m4v|avi)$/i.test(name);
   });
 
-  if (validAttachment) return true;
+  const hasDirectMediaLink =
+    /https?:\/\/[^\s<>]+\.(png|jpg|jpeg|gif|webp|mp4|mov|webm)(?:\?[^\s<>]*)?/i
+      .test(message.content);
 
-  // GIFs, videos, images and linked media
-  const validEmbed = message.embeds.some(embed => {
-    return (
-      embed.image ||
-      embed.video ||
-      embed.thumbnail ||
-      embed.type === 'gifv' ||
-      embed.type === 'image' ||
-      embed.type === 'video'
-    );
-  });
+  const hasVideoLink =
+    /https?:\/\/(?:www\.|m\.)?(?:youtube\.com|youtu\.be|tiktok\.com|instagram\.com\/(?:reel|p)\/)[^\s<>]*/i
+      .test(message.content);
 
-  return validEmbed;
+  return hasMediaFile || hasDirectMediaLink || hasVideoLink;
 }
 
-async function fetchRecentMessages(channel) {
-  return channel.messages.fetch({
-    limit: 100
-  });
-}
+// =====================================
+// DELETE OLD STICKY MESSAGES
+// =====================================
 
-async function refreshSticky(channel, forceNew = false) {
-  const messages = await fetchRecentMessages(channel);
+async function deleteOldStickies(channel) {
+  let before;
+  let checked = 0;
 
-  const stickyMessages = messages.filter(message =>
-    message.author.id === client.user.id &&
-    message.content === STICKY_TEXT
-  );
+  while (checked < 100) {
+    const options = {
+      limit: Math.min(100, 100 - checked)
+    };
 
-  const newestSticky = stickyMessages.first();
-
-  // If the last message is already the only sticky,
-  // do not send another one.
-  const lastMessage = messages.first();
-
-  if (
-    !forceNew &&
-    newestSticky &&
-    lastMessage?.id === newestSticky.id &&
-    stickyMessages.size === 1
-  ) {
-    stickyIds.set(channel.id, newestSticky.id);
-    return;
-  }
-
-  // Delete previous sticky messages
-  for (const message of stickyMessages.values()) {
-    await message.delete().catch(error => {
-      console.error(
-        `Could not delete old sticky in ${channel.id}:`,
-        error.message
-      );
-    });
-  }
-
-  // Also delete the remembered sticky if not in last 100
-  const rememberedId = stickyIds.get(channel.id);
-
-  if (
-    rememberedId &&
-    !stickyMessages.has(rememberedId)
-  ) {
-    const oldMessage = await channel.messages
-      .fetch(rememberedId)
-      .catch(() => null);
-
-    if (
-      oldMessage &&
-      oldMessage.author.id === client.user.id &&
-      oldMessage.content === STICKY_TEXT
-    ) {
-      await oldMessage.delete().catch(() => {});
+    if (before) {
+      options.before = before;
     }
-  }
 
-  const newSticky = await channel.send({
+    const messages = await channel.messages.fetch(options);
+
+    if (messages.size === 0) break;
+
+    checked += messages.size;
+
+    const oldest = messages.last();
+
+    const oldStickies = messages.filter(message =>
+      message.author.id === client.user.id &&
+      message.content === STICKY_TEXT
+    );
+
+    for (const message of oldStickies.values()) {
+      try {
+        await message.delete();
+      } catch (error) {
+        console.error(
+          'FAILED TO DELETE OLD STICKY:',
+          error.message
+        );
+      }
+    }
+
+    if (messages.size < options.limit) break;
+
+    before = oldest.id;
+  }
+}
+
+// =====================================
+// REFRESH STICKY MESSAGE
+// =====================================
+
+async function refreshSticky(channel) {
+  await deleteOldStickies(channel);
+
+  await channel.send({
     content: STICKY_TEXT,
     allowedMentions: {
       parse: []
     }
   });
 
-  stickyIds.set(channel.id, newSticky.id);
+  console.log(`STICKY UPDATED: ${channel.id}`);
 }
+
+// =====================================
+// BOT READY
+// =====================================
 
 client.once(Events.ClientReady, async () => {
   console.log(`STREAK BOT ONLINE: ${client.user.tag}`);
@@ -158,63 +157,110 @@ client.once(Events.ClientReady, async () => {
     try {
       const channel = await client.channels.fetch(channelId);
 
-      if (!channel || !channel.isTextBased()) {
-        console.log(`Channel not found: ${channelId}`);
+      if (
+        !channel ||
+        channel.guildId !== GUILD_ID ||
+        !channel.isTextBased() ||
+        !channel.messages
+      ) {
+        console.log(`INVALID CHANNEL: ${channelId}`);
         continue;
       }
 
-      if (channel.guild?.id !== GUILD_ID) continue;
+      await enqueue(channelId, async () => {
+        await refreshSticky(channel);
+      });
 
-      await runInQueue(channel.id, () =>
-        refreshSticky(channel)
-      );
+      console.log(`CHANNEL READY: ${channelId}`);
 
-      console.log(`Streak channel ready: ${channelId}`);
     } catch (error) {
       console.error(
-        `Startup error in ${channelId}:`,
+        `STARTUP ERROR IN ${channelId}:`,
         error
       );
     }
   }
 });
 
+// =====================================
+// NEW MESSAGE
+// =====================================
+
 client.on(Events.MessageCreate, async message => {
   if (!message.guild) return;
+
   if (message.guild.id !== GUILD_ID) return;
-  if (!CHANNEL_IDS.includes(message.channel.id)) return;
+
+  if (!CHANNEL_IDS.includes(message.channelId)) return;
+
+  // تجاهل رسائل البوتات
   if (message.author.bot) return;
 
-  await runInQueue(message.channel.id, async () => {
-    try {
-      // Re-fetch to allow embeds to resolve
-      let currentMessage = await message.fetch()
-        .catch(() => message);
+  try {
+    await enqueue(message.channelId, async () => {
 
-      if (!hasMedia(currentMessage)) {
-        // Give linked media embeds a moment to load
-        if (
-          /https?:\/\/\S+/i.test(currentMessage.content)
-        ) {
-          await new Promise(resolve =>
-            setTimeout(resolve, 1500)
+      // =================================
+      // TEXT ONLY = DELETE
+      // =================================
+
+      if (!isAllowedPost(message)) {
+        try {
+          await message.delete();
+
+          console.log(
+            `TEXT DELETED: ${message.author.username}`
           );
 
-          currentMessage = await message.fetch()
-            .catch(() => currentMessage);
-        }
-      }
-
-      if (!hasMedia(currentMessage)) {
-        await message.delete().catch(error => {
+        } catch (error) {
           console.error(
-            'Could not delete text message:',
-            error.message
+            'FAILED TO DELETE TEXT:',
+            error
           );
-        });
+        }
 
         return;
       }
 
-      // Valid photo/video: move sticky to bottom
-      await refreshSticky(message.channel, true);
+      // =================================
+      // IMAGE / VIDEO = KEEP
+      // =================================
+
+      console.log(
+        `POST ACCEPTED: ${message.author.username}`
+      );
+
+      // تحديث تنبيه Posts Only
+      await refreshSticky(message.channel);
+
+    });
+
+  } catch (error) {
+    console.error('MESSAGE ERROR:', error);
+  }
+});
+
+// =====================================
+// ERROR HANDLING
+// =====================================
+
+client.on(Events.Error, error => {
+  console.error('DISCORD CLIENT ERROR:', error);
+});
+
+process.on('unhandledRejection', error => {
+  console.error('UNHANDLED REJECTION:', error);
+});
+
+// =====================================
+// LOGIN
+// =====================================
+
+if (!TOKEN) {
+  console.error('ERROR: TOKEN IS MISSING');
+  process.exit(1);
+}
+
+client.login(TOKEN).catch(error => {
+  console.error('LOGIN FAILED:', error);
+  process.exit(1);
+});
